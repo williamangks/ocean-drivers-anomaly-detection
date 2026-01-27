@@ -1,0 +1,30 @@
+# sources.yaml usage:
+# Documents the upstream data sources used in the pipeline.
+# This file is human-readable metadata (not code) that:
+#	- clarifies where data comes from,
+#	- clarifies update frequency / time resolution,
+#	- helps readers understand acronyms and dataset roles.
+#
+# Acronyms:
+#	- NOAA: National Oceanic and Atmospheric Administration (USA)
+#	- SST: Sea Surface Temperature
+#	- OISST: Optimum Interpolation Sea Surface Temperature (a NOAA SST product)
+#	- ERDDAP: "Environmental Research Division's Data Access Program"
+#				A data server that lets you query subsets of datasets over HTTP.
+#	- Chlorophyll-a (Chl-a): satellite-derived proxy related to phytoplankton biomass
+#	- Reanalysis: model + observations combined to reconstruct consistent historical fields
+
+
+sources:
+	sst:
+		name: "NOAA OISST v2.1"
+		temporal: "daily"
+		notes: "Used for backfill and anomaly-friendly SST baseline"
+
+	chlorophyll:
+		name: "NOAA CoastWatch ERDDAP (8-day chlorophyll-a)"
+		temporal: "8-day"
+
+	waves:
+		name: "Copernicus Global Ocean Waves Reanalysis"
+		temporal: "monthly/3-hourly (aggregated)"

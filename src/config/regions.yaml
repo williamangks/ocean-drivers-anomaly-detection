@@ -1,0 +1,31 @@
+# regions.yaml usage:
+# Defines geographic Selected Regions for the project.
+# Each region is defined as bounding box (boundbox) in WGS84 (World Geodetic System 1984) 
+# standard datum components, latitude/longitude.
+#
+# Selected Regions:
+#	1) NTT (Nusa Tenggara Timur / East Nusa Tenggara - Indonesia) - selected as a region
+#		that is similar characteristics with Hawaii
+#	2) HAWAII: Hawaii islands - selected as baseline/reference region
+# 
+# Notes:
+# 	- lat: latitude in degrees (south is negative, north is positive)
+# 	- lon: longitude in degrees (west is negative, east is positive)
+# 	- boundbox: is used to subset global gridded datasets (SST, chlorophyll, waves)
+
+regions:
+	NTT:
+		name: "East Nusa Tenggara (NTT - Flores/Alor) box"
+		boundbox:
+			lon_min: 120.0
+			lon_max: 125.0
+			lat_min: -10.0
+			lat_max: -7.0
+
+	HAWAII:
+		name: "Hawaii box"
+		boundbox:
+			lon_min: -161.0
+			lon_max: -154.0
+			lat_min: 18.0
+			lat_max: 23.0
