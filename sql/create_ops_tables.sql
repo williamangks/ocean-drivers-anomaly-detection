@@ -5,8 +5,6 @@
 --		- for auditing what ran and when
 --		- debug failures		
 
-CREATE SCHEMA IF NOT EXISTS ops;
-
 -- ops.pipeline_runs
 -- One row per pipeline/job execution
 -- This supports monitoring and reproducibility.
