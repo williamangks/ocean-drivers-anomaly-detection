@@ -147,3 +147,8 @@ This project uses BigQuery datasets created in `asia-southeast2` (Jakarta).
 ./scripts/provision_bigquery.sh <YOUR_GCP_PROJECT_ID>
 
 ---
+
+
+
+## Dependencies
+pandas

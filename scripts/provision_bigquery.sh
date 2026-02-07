@@ -16,8 +16,8 @@ echo "Using project: ${PROJECT_ID}"
 echo "Using BigQuery location: ${LOCATION}"
 
 # Create datasets (if exists will return an error, just ignore it)
-bq --project_id="${PROJECT_ID}" --location="${LOCATION}" mk -d ops || true
-bq --project_id="${PROJECT_ID}" --location="${LOCATION}" mk -d standard || true
+bq --project_id="${PROJECT_ID}" --location="${LOCATION}" mk --dataset ops 2>/dev/null || true
+bq --project_id="${PROJECT_ID}" --location="${LOCATION}" mk --dataset standard 2>/dev/null || true
 
 # Create tables
 bq --project_id="${PROJECT_ID}" query --use_legacy_sql=false < sql/create_ops_tables.sql

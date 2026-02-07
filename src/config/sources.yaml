@@ -16,15 +16,15 @@
 
 
 sources:
-	sst:
-		name: "NOAA OISST v2.1"
-		temporal: "daily"
-		notes: "Used for backfill and anomaly-friendly SST baseline"
+    sst:
+        name: "NOAA OISST v2.1"
+        temporal: "daily"
+        notes: "Used for backfill and anomaly-friendly SST baseline"
 
-	chlorophyll:
-		name: "NOAA CoastWatch ERDDAP (8-day chlorophyll-a)"
-		temporal: "8-day"
+    chlorophyll:
+        name: "NOAA CoastWatch ERDDAP (8-day chlorophyll-a)"
+        temporal: "8-day"
 
-	waves:
-		name: "Copernicus Global Ocean Waves Reanalysis"
-		temporal: "monthly/3-hourly (aggregated)"
+    waves:
+        name: "Copernicus Global Ocean Waves Reanalysis"
+        temporal: "monthly/3-hourly (aggregated)"

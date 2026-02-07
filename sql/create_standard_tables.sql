@@ -14,12 +14,12 @@
 --------------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS standard.sst_daily (
   date DATE NOT NULL,
-  region_id STRING NOT NULL,  -- e.g., 'HAWAII', 'NTT'
+  region_id STRING NOT NULL,  -- example 'HAWAII', 'NTT'
   lat FLOAT64 NOT NULL,
   lon FLOAT64 NOT NULL,
   sst_c FLOAT64,              -- Sea Surface Temperature (degrees Celsius)
-  source STRING,              -- e.g., 'NOAA_OISST'
-  ingested_at TIMESTAMP
+  source STRING NOT NULL,              -- example 'NOAA_OISST'
+  ingested_at TIMESTAMP NOT NULL
 )
 PARTITION BY date
 CLUSTER BY region_id;
@@ -35,8 +35,8 @@ CREATE TABLE IF NOT EXISTS standard.chl_8day (
   lat FLOAT64 NOT NULL,
   lon FLOAT64 NOT NULL,
   chl_mg_m3 FLOAT64,          -- Chlorophyll-a concentration (mg/m^3)
-  source STRING,              -- e.g., 'NOAA_ERDDAP_CHLA_8DAY'
-  ingested_at TIMESTAMP
+  source STRING NOT NULL,              -- example 'NOAA_ERDDAP_CHLA_8DAY'
+  ingested_at TIMESTAMP NOT NULL
 )
 PARTITION BY period_start_date
 CLUSTER BY region_id;
@@ -52,8 +52,8 @@ CREATE TABLE IF NOT EXISTS standard.waves_daily (
   lon FLOAT64 NOT NULL,
   swh_m FLOAT64,              -- Significant Wave Height (meters)
   peak_period_s FLOAT64,      -- Peak wave period (seconds)
-  source STRING,              -- e.g., 'CMEMS_WAVES_REANALYSIS'
-  ingested_at TIMESTAMP
+  source STRING NOT NULL,              -- example 'CMEMS_WAVES_REANALYSIS'
+  ingested_at TIMESTAMP NOT NULL
 )
 PARTITION BY date
 CLUSTER BY region_id;
