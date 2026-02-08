@@ -1,0 +1,16 @@
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Local data / downloads / caches
+data/tmp/
+
+# Editor backups
+*.save
+
+# Virtual env
+.venv/
+
+# OS junk
+.DS_Store
+Thumbs.db
