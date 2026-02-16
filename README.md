@@ -1,154 +1,177 @@
-# Ocean Environmental Anomaly Platform
+# Ocean Drivers Data Platform (SST + Chlorophyll)
 
-End-to-end data platform for detecting and interpreting **multivariate ocean environmental anomalies** using long-term historical data (2001–2020).  
-This project focuses on **batch/backfill** processing and reproducible analytics outputs for dashboards.
+A practical data engineering project that ingests and standardizes **ocean environmental driver** datasets for two regions (**HAWAII** and **NTT, Indonesia**) into **BigQuery (Jakarta region: asia-southeast2)**.
 
-## Why this project
-Ocean systems can shift in abnormal ways due to changes in multiple environmental drivers (e.g., temperature, chlorophyll, waves).  
-This repository builds a pipeline to:
+The repo is built to be:
+- reproducible (provision + run from scratch)
+- cheap (free-tier friendly)
+- production-like (idempotent runs, retries, caching, validation, logging)
 
-- ingest and standardize gridded ocean datasets for two regions (**Hawaiʻi** and **NTT, Indonesia**)
-- engineer anomaly-friendly features
-- detect multivariate anomalies using **Isolation Forest**
-- interpret relationships between drivers (co-occurrence and lead/lag) *conditional on anomalous periods*
-- publish results to **BigQuery** for visualization in **Looker Studio**
+---
 
-## Scope
-### Included
-- Backfill (historical) pipeline for **2001–2020**
-- Regions:
-  - **HAWAII** (Hawaiian Islands bounding box)
-  - **NTT** (East Nusa Tenggara bounding box)
-- Outputs for:
-  - **Map drill-down** (geopoint anomaly view)
-  - **Regional interpretation** (time-series metrics)
-- Monitoring via:
-  - **Cloud Logging** (job logs)
-  - **Cloud Monitoring** (Cloud Run Job metrics + alerts)
+## What this project is (current status)
+Implemented now:
+- BigQuery provisioning (datasets + tables) via script
+- SST ingestion (NOAA OISST v2.1 via ERDDAP) → `standard.sst_daily`
+- Chlorophyll ingestion (8-day composites via ERDDAP) → `standard.chl_8day`
+- Shared ingestion helpers (download retry, atomic writes, NetCDF validation, schema checks)
 
-### Not included (by design)
-- True incremental scheduling (this is handled in a separate Project 2 repo)
-- Public REST prediction API for dashboard serving
-- Prometheus/Grafana stack
+Planned next:
+- Waves ingestion → `standard.waves_daily`
+- Pipeline run tracking + per-source watermarks
+- Weekly orchestration (Cloud Scheduler → Cloud Run Jobs or GitHub Actions cron)
 
-## Data Sources (high level)
-This project uses global ocean datasets and subsets them by region.
+---
 
-- **NOAA OISST** (Sea Surface Temperature, daily)  
-  NOAA = National Oceanic and Atmospheric Administration (US)  
-  OISST = Optimum Interpolation Sea Surface Temperature
+## Data sources (high level)
+This project subsets global gridded datasets by region bounding box.
 
-- **NOAA CoastWatch ERDDAP** (Chlorophyll-a, 8-day composites)  
-  ERDDAP = Environmental Research Division’s Data Access Program (data server)
+- **SST (daily):** NOAA OISST v2.1 via ERDDAP  
+- **Chlorophyll-a (8-day):** NOAA CoastWatch ERDDAP dataset `erdMBchla8day_LonPM180`
+- **Waves:** TBD (will choose an open dataset with no auth if possible)
 
-- **Copernicus Marine** (Global waves reanalysis; aggregated to match analysis grain)  
-  Reanalysis = reconstruction using models + observations
+See `src/config/sources.yaml` for human-readable source notes.
 
-See `src/config/sources.yaml` for the documented list and roles.
+---
 
-## Architecture (GCP)
-**Storage & serving**
-- **GCS (Cloud Storage)**: raw/curated artifacts + model versions
-- **BigQuery**: curated tables + mart tables (Looker Studio reads from here)
-- **Looker Studio**: dashboards (map + interpretation)
-
-**Compute**
-- Local dev / notebook prototyping (optional)
-- Batch execution via scripts (and optionally Cloud Run Jobs later)
-
-**Observability**
-- **Cloud Logging**: job logs, error traces
-- **Cloud Monitoring**: basic job metrics + alerting on failures
-
-## Model artifact storage (no API)
-Models are stored as versioned artifacts in **GCS**, not served by an API.
-
-Example layout:
-- `gs://<YOUR_BUCKET>/project1/models/iforest/runs/<RUN_ID>/model.joblib`
-- `.../feature_schema.json` (ordered feature list to prevent column-order bugs)
-- `.../train_config.json`
-- `.../train_watermark.json`
-- `.../metrics.json`
-- `gs://<YOUR_BUCKET>/project1/models/iforest/LATEST.json` (pointer to active version)
-
-This keeps the system simple, cheap, and reproducible.
-
-## Configuration
+## Regions
 Regions are defined in `src/config/regions.yaml` using a **boundbox** (bounding box):
 
 - `lat_min`, `lat_max` (degrees)
 - `lon_min`, `lon_max` (degrees)
 
-> Note: Latitude south is negative; longitude west is negative.
+Notes:
+- latitude south is negative
+- longitude west is negative
 
-## BigQuery datasets (recommended)
-Create these datasets in your project:
-- `ops` — run tracking tables
-- `curated` — standardized driver tables and feature tables
-- `mart` — dashboard-ready tables
+---
 
-SQL starter: `sql/create_ops_tables.sql`
+## BigQuery layout
+Datasets (Jakarta region `asia-southeast2`):
+- `ops` — operational tracking tables (runs, later: watermarks)
+- `standard` — standardized driver tables
 
-## Repository layout
+Tables:
+- `standard.sst_daily`
+- `standard.chl_8day`
+- `standard.waves_daily` (placeholder for next ingestion)
+
+---
+
+## Repo structure
 src/
-config/ # regions.yaml, sources.yaml
-ingest/ # fetch/subset each driver
-transform/ # standardize + feature engineering
-model/ # train + score isolation forest
-mart/ # build dashboard tables
-sql/ # BigQuery DDL
-.github/workflows/ # optional automation later
+|_ config/
+|    |_ regions.yaml
+|    |_ sources.yaml
+|
+|_ ingest/
+|    |_ sst.py
+|    |_ chl.py
+|
+|_ helpers/
+|    |_ bigquery.py
+|    |_ dates.py
+|    |_ df_validate.py
+|    |_ erddap.py
+|    |_ netcdf.py
+|    |_ regions.py
+|    |_ syslogging.py
+|    |_ xr_utils.py
+|
+|_ sql/
+|    |_ create_ops_tables.sql
+|    |_ create_standard_tables.sql
+|
+|_ scripts/
+|    |_ provision_bigquery.sh
 
 
 
-## Outputs for Looker Studio
-This project produces two primary dashboard tables:
 
-1) **Geopoint drill-down**
-- anomaly points by time and location for interactive map exploration
-
-2) **Regional interpretation**
-- daily/weekly regional metrics (anomaly rate, average score, driver summaries)
-
-## Disclaimer (important)
-This project performs **anomaly detection and association analysis**.  
-It does **not** claim causal attribution (e.g., “X causes Y”). Interpretations are framed as:
-- co-occurrence patterns
-- lead/lag relationships
-- conditional relationships during anomalous windows
-
-## Getting started (high level)
-1) Configure regions and sources:
-- `src/config/regions.yaml`
-- `src/config/sources.yaml`
-
-2) Create BigQuery ops table:
-- run `sql/create_ops_tables.sql`
-
-3) Backfill drivers (2001–2020):
-- ingest SST → ingest chlorophyll → ingest waves
-
-4) Build features → train model → score → publish mart tables
 
 ---
 
-### Project metadata
-- GCP project: `<YOUR_GCP_PROJECT_ID>`
-- GCS bucket: `gs://<YOUR_BUCKET>`
-- Regions: Hawaiʻi, NTT (Indonesia)
-- Period: 2001–2020
+## Setup from scratch
 
----
+### 1) Prerequisites
+- Python 3.10+ recommended
+- Google Cloud SDK (`gcloud`, `bq`)
+- Access to a GCP project where you can create BigQuery datasets
 
-## Provision BigQuery (Jakarta region)
-This project uses BigQuery datasets created in `asia-southeast2` (Jakarta).
-
+### 2) Create and activate venv
 ```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+
+
+### 3) Authenticate to GCP (ADC for Python)
+gcloud auth login
+gcloud config set project <YOUR_GCP_PROJECT_ID>
+gcloud auth application-default login
+gcloud auth application-default set-quota-project <YOUR_GCP_PROJECT_ID>
+
+
+### 4) Provision BigQuery (Jakarta: asia-southeast2)
+This creates datasets ops and standard and creates all required tables.
 ./scripts/provision_bigquery.sh <YOUR_GCP_PROJECT_ID>
 
+Verify:
+bq ls <YOUR_GCP_PROJECT_ID>:standard
+
+
 ---
+## Ingestion
+### SST (NOAA OISST daily)
+Dry run (download + parse only):
+python -m src.ingest.sst \
+  --region_id NTT \
+  --year 2001 \
+  --month 1 \
+  --bq_project <YOUR_GCP_PROJECT_ID> \
+  --dry_run
+
+Load to BigQuery:
+python -m src.ingest.sst \
+  --region_id NTT \
+  --year 2001 \
+  --month 1 \
+  --bq_project <YOUR_GCP_PROJECT_ID> \
+  --replace
+
+### Chlorophyll-a (8-day composites)
+Dry run:
+python -m src.ingest.chl \
+  --region_id NTT \
+  --year 2024 \
+  --month 1 \
+  --bq_project <YOUR_GCP_PROJECT_ID> \
+  --dry_run
+
+Load to BigQuery:
+python -m src.ingest.chl \
+  --region_id NTT \
+  --year 2024 \
+  --month 1 \
+  --bq_project <YOUR_GCP_PROJECT_ID> \
+  --replace
 
 
+---
+## Validation queries (BigQuery)
+### SST:
+SELECT region_id, COUNT(*) rows, MIN(date) min_date, MAX(date) max_date
+FROM `standard.sst_daily`
+WHERE region_id='NTT' AND date BETWEEN '2001-01-01' AND '2001-01-31'
+GROUP BY region_id;
 
-## Dependencies
-pandas
+### Chlorophyll:
+SELECT region_id, COUNT(*) rows, MIN(period_start_date) min_start, MAX(period_end_date) max_end
+FROM `standard.chl_8day`
+WHERE region_id='NTT' AND period_start_date BETWEEN '2024-01-01' AND '2024-01-31'
+GROUP BY region_id;
+
+
+---
+## Notes on Cost
+BigQuery costs are mostly driven by query scans and storage. This project keeps tables partitioned by date and clustered by region_id to reduce scan cost.
