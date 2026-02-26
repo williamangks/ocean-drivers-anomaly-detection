@@ -1,30 +1,34 @@
-# sources.yaml usage:
-# Documents the upstream data sources used in the pipeline.
-# This file is human-readable metadata (not code) that:
-#	- clarifies where data comes from,
-#	- clarifies update frequency / time resolution,
-#	- helps readers understand acronyms and dataset roles.
-#
-# Acronyms:
-#	- NOAA: National Oceanic and Atmospheric Administration (USA)
-#	- SST: Sea Surface Temperature
-#	- OISST: Optimum Interpolation Sea Surface Temperature (a NOAA SST product)
-#	- ERDDAP: "Environmental Research Division's Data Access Program"
-#				A data server that lets you query subsets of datasets over HTTP.
-#	- Chlorophyll-a (Chl-a): satellite-derived proxy related to phytoplankton biomass
-#	- Reanalysis: model + observations combined to reconstruct consistent historical fields
-
+# Human-readable metadata about upstream data sources (not code).
+# Used to keep documentation aligned with ingestion implementations.
 
 sources:
-    sst:
-        name: "NOAA OISST v2.1"
-        temporal: "daily"
-        notes: "Used for backfill and anomaly-friendly SST baseline"
+  sst:
+    name: "NOAA OISST v2.1 (via ERDDAP griddap)"
+    dataset_id: "ncdcOisst21Agg"
+    erddap_base: "https://coastwatch.pfeg.noaa.gov/erddap/griddap"
+    temporal: "daily"
+    notes: >
+      Daily SST, surface-only (zlev=0.0). Dataset longitude is 0..360; ingestion converts bbox
+      longitude to 0..360 and queries an end-exclusive UTC window [d0, d1+1).
 
-    chlorophyll:
-        name: "NOAA CoastWatch ERDDAP (8-day chlorophyll-a)"
-        temporal: "8-day"
+  chlorophyll:
+    name: "NOAA CoastWatch Chlorophyll-a 8-day composite (via ERDDAP griddap)"
+    dataset_id: "erdMBchla8day_LonPM180"
+    erddap_base: "https://coastwatch.pfeg.noaa.gov/erddap/griddap"
+    temporal: "8-day"
+    notes: >
+      ERDDAP `time` is centered per 8-day composite. Ingestion converts to a window:
+      start=center-3d, end=center+4d, then keeps composites overlapping the target month.
+      Longitude is -180..180 (no conversion). Uses altitude=0.0.
 
-    waves:
-        name: "Copernicus Global Ocean Waves Reanalysis"
-        temporal: "monthly/3-hourly (aggregated)"
+  waves:
+    name: "WaveWatch III (WW3) global model (via ERDDAP griddap)"
+    dataset_id: "NWW3_Global_Best"
+    erddap_base: "https://coastwatch.pfeg.noaa.gov/erddap/griddap"
+    temporal: "hourly -> daily mean"
+    variables:
+      Thgt: "significant wave height (m) -> swh_m"
+      Tper: "peak wave period (s) -> peak_period_s"
+    notes: >
+      Dataset longitude is 0..360; ingestion supports dateline-crossing regions by splitting the
+      lon interval into up to two requests. Downloads hourly fields and aggregates to daily mean.

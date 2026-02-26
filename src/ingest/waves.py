@@ -1,4 +1,4 @@
-!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 Ingest WaveWatch III (WW3) Global Wave Model via ERDDAP into BigQuery standard.waves_daily.
 
@@ -20,6 +20,7 @@ Notes:
 
 from __future__ import annotations
 
+import uuid
 import argparse
 import datetime as dt
 from pathlib import Path
@@ -28,11 +29,15 @@ from typing import List, Sequence
 import pandas as pd
 import xarray as xr
 
+from src.ingest.helpers.bigquery import (
+    delete_existing_waves_rows,
+    load_to_bigquery,
+    log_pipeline_run,
+)
 from src.ingest.helpers.syslogging import make_logger, LogFn
 from src.ingest.helpers.regions import load_regions, BoundBox
 from src.ingest.helpers.dates import month_range
 from src.ingest.helpers.netcdf import ensure_local_netcdf
-from src.ingest.helpers.bigquery import load_to_bigquery, delete_existing_waves_rows
 from src.ingest.helpers.df_validate import require_columns, require_non_nulls
 from src.ingest.helpers.erddap import (
     lon_intervals_360,
@@ -146,8 +151,8 @@ def build_0_360_lon_split_urls(
             lat_max=lat_max,
             lon_min=min(lo0, lo1),
             lon_max=max(lo0, lo1),
-            include_depth_dim=include_depth_dim,
-            depth_value=depth_value,
+            include_singleton_dim=include_singleton_dim,
+            singleton_value=singleton_value,
         )
         url = build_griddap_nc_url(base=base, dataset_id=dataset_id, variables=variables, dims=dims)
         out.append((url, (lo0, lo1)))
@@ -295,93 +300,141 @@ def log_row_stats(df: pd.DataFrame, log: LogFn) -> None:
         level="INFO",
     )
 
-
 def main() -> None:
     args = parse_args()
     log = make_logger(args.log_level, DRIVER_NAME)
 
-    if not (1 <= args.month <= 12):
-        raise SystemExit("--month must be between 1 and 12")
+    run_id = str(uuid.uuid4())
+    start_ts = dt.datetime.now(dt.timezone.utc)
+    rows_written = 0
+    status = "FAILED"
+    notes = ""
 
-    if args.year < 2016 or args.year > dt.date.today().year + 1:
-        raise SystemExit("--year seems out of range")
+    try:
+        if not (1 <= args.month <= 12):
+            raise SystemExit("--month must be between 1 and 12")
 
-    regions = load_regions(args.regions_yaml)
-    if args.region_id not in regions:
-        known = ", ".join(sorted(regions.keys()))
-        raise SystemExit(f"Unknown --region_id {args.region_id!r}. Known: {known}")
-    bb = regions[args.region_id]
+        if args.year < 2016 or args.year > dt.date.today().year + 1:
+            raise SystemExit("--year seems out of range")
 
-    d0, d1 = month_range(args.year, args.month)
+        regions = load_regions(args.regions_yaml)
+        if args.region_id not in regions:
+            known = ", ".join(sorted(regions.keys()))
+            raise SystemExit(f"Unknown --region_id {args.region_id!r}. Known: {known}")
+        bb = regions[args.region_id]
 
-    log(
-        f"start region={args.region_id} period={d0}..{d1} "
-        f"dry_run={args.dry_run} replace={args.replace} "
-        f"force_download={args.force_download} min_bytes={args.min_bytes} "
-        f"no_depth_dim={args.no_depth_dim} dataset_id={DATASET_ID} vars={list(VAR_MAP.keys())}",
-        level="INFO",
-    )
+        d0, d1 = month_range(args.year, args.month)
 
-    out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    url_specs = build_0_360_lon_split_urls(
-        base=ERDDAP_BASE,
-        dataset_id=DATASET_ID,
-        variables=list(VAR_MAP.keys()),
-        date_start=d0,
-        date_end=d1,
-        bb=bb,
-        include_depth_dim=not args.no_depth_dim,
-        depth_value=0.0,
-    )
-
-    local_paths = download_intervals(
-        url_specs=url_specs,
-        out_dir=out_dir,
-        region_id=args.region_id,
-        year=args.year,
-        month=args.month,
-        force_download=args.force_download,
-        min_bytes=args.min_bytes,
-        log=log,
-    )
-
-    with open_xr_datasets(local_paths) as dsets:
-        ds_daily = to_daily_mean_dataset(
-            dsets,
-            var_map=VAR_MAP,
-            singleton_dim=None if args.no_depth_dim else "depth",
-            singleton_value=0.0,
-            value_ranges=VALUE_RANGES,
+        log(
+            f"start region={args.region_id} period={d0}..{d1} "
+            f"dry_run={args.dry_run} replace={args.replace} "
+            f"force_download={args.force_download} min_bytes={args.min_bytes} "
+            f"no_depth_dim={args.no_depth_dim} dataset_id={DATASET_ID} vars={list(VAR_MAP.keys())}",
+            level="INFO",
         )
-        df = daily_to_dataframe(ds_daily, region_id=args.region_id, d0=d0, d1=d1, log=log)
 
-    log(f"rows_ready={len(df):,}", level="INFO")
+        out_dir = Path(args.out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
 
-    if args.log_row_stats:
-        log_row_stats(df, log)
+        url_specs = build_0_360_lon_split_urls(
+            base=ERDDAP_BASE,
+            dataset_id=DATASET_ID,
+            variables=list(VAR_MAP.keys()),
+            date_start=d0,
+            date_end=d1,
+            bb=bb,
+            include_singleton_dim=not args.no_depth_dim,
+            singleton_value=0.0,
+        )
 
-    if args.dry_run:
-        log("dry_run: skipped BigQuery load.", level="INFO")
-        return
+        local_paths = download_intervals(
+            url_specs=url_specs,
+            out_dir=out_dir,
+            region_id=args.region_id,
+            year=args.year,
+            month=args.month,
+            force_download=args.force_download,
+            min_bytes=args.min_bytes,
+            log=log,
+        )
 
-    table_id = f"{args.bq_project}.{args.bq_dataset}.{args.bq_table}"
+        with open_xr_datasets(local_paths) as dsets:
+            ds_daily = to_daily_mean_dataset(
+                dsets,
+                var_map=VAR_MAP,
+                singleton_dim=None if args.no_depth_dim else "depth",
+                singleton_value=0.0,
+                value_ranges=VALUE_RANGES,
+            )
+            df = daily_to_dataframe(ds_daily, region_id=args.region_id, d0=d0, d1=d1, log=log)
 
-    if args.replace:
-        log(f"replace=true delete_existing table={table_id} region={args.region_id} period={d0}..{d1}", level="INFO")
-        delete_existing_waves_rows(args.bq_project, args.bq_dataset, args.bq_table, args.region_id, d0, d1)
-    else:
-        log("replace=false (append only)", level="INFO")
+        log(f"rows_ready={len(df):,}", level="INFO")
 
-    if df[REQUIRED_COLS].isna().any().any():
-        bad = df[df[REQUIRED_COLS].isna().any(axis=1)].head(10)
-        raise ValueError(f"Nulls in REQUIRED fields:\n{bad}")
+        if args.log_row_stats:
+            log_row_stats(df, log)
 
-    log(f"load_bq table={table_id} rows={len(df):,}", level="INFO")
-    load_to_bigquery(df, args.bq_project, args.bq_dataset, args.bq_table, BQ_SCHEMA)
-    log(f"done table={table_id}", level="INFO")
+        table_id = f"{args.bq_project}.{args.bq_dataset}.{args.bq_table}"
 
+        if args.dry_run:
+            log("dry_run: skipped BigQuery load.", level="INFO")
+            status = "SUCCESS"
+            rows_written = 0
+        else:
+            if args.replace:
+                log(
+                    f"replace=true delete_existing table={table_id} region={args.region_id} period={d0}..{d1}",
+                    level="INFO",
+                )
+                delete_existing_waves_rows(args.bq_project, args.bq_dataset, args.bq_table, args.region_id, d0, d1)
+            else:
+                log("replace=false (append only)", level="INFO")
+
+            if df[REQUIRED_COLS].isna().any().any():
+                bad = df[df[REQUIRED_COLS].isna().any(axis=1)].head(10)
+                raise ValueError(f"Nulls in REQUIRED fields:\n{bad}")
+
+            log(f"load_bq table={table_id} rows={len(df):,}", level="INFO")
+            load_to_bigquery(df, args.bq_project, args.bq_dataset, args.bq_table, BQ_SCHEMA)
+
+            status = "SUCCESS"
+            rows_written = len(df)
+
+        notes = (
+            f"region={args.region_id} year={args.year} month={args.month} "
+            f"dry_run={args.dry_run} replace={args.replace} "
+            f"table={args.bq_dataset}.{args.bq_table} "
+            f"dataset_id={DATASET_ID} no_depth_dim={args.no_depth_dim}"
+        )
+
+    except Exception as e:
+        err_msg = f"{type(e).__name__}: {e}"
+        notes = (
+            f"region={getattr(args, 'region_id', None)} "
+            f"year={getattr(args, 'year', None)} month={getattr(args, 'month', None)} "
+            f"dry_run={getattr(args, 'dry_run', None)} replace={getattr(args, 'replace', None)} "
+            f"table={getattr(args, 'bq_dataset', None)}.{getattr(args, 'bq_table', None)} "
+            f"dataset_id={DATASET_ID} "
+            f"err={err_msg[:500]}"
+        )
+        status = "FAILED"
+        rows_written = 0
+        raise
+
+    finally:
+        end_ts = dt.datetime.now(dt.timezone.utc)
+        try:
+            log_pipeline_run(
+                project=args.bq_project,
+                run_id=run_id,
+                job_name="ingest_waves",
+                start_ts=start_ts,
+                end_ts=end_ts,
+                status=status,
+                rows_written=rows_written,
+                notes=notes,
+            )
+        except Exception as e:
+            print(f"[pipeline_runs] ERROR (script wrapper): {e}", flush=True)
 
 if __name__ == "__main__":
     main()

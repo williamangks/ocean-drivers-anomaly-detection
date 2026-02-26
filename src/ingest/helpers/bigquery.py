@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import uuid
 import datetime as dt
 import pandas as pd
 from google.cloud import bigquery
@@ -116,3 +117,61 @@ def delete_existing_waves_rows(
         ]
     )
     client.query(sql, job_config=job_config).result()
+
+import uuid
+from google.cloud import bigquery
+
+def _to_rfc3339_utc(ts: dt.datetime) -> str:
+    """
+    Convert datetime to RFC3339 UTC string BigQuery accepts for TIMESTAMP.
+    Example: 2026-02-16T03:04:05.123456Z
+    """
+    if ts.tzinfo is None:
+        # Assume UTC if naive
+        ts = ts.replace(tzinfo=dt.timezone.utc)
+    ts = ts.astimezone(dt.timezone.utc)
+    return ts.isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+def log_pipeline_run(
+    *,
+    project: str,
+    run_id: str,
+    job_name: str,
+    start_ts: dt.datetime,
+    end_ts: dt.datetime,
+    status: str,
+    rows_written: int,
+    notes: str,
+) -> None:
+    """
+    Insert one row into ops.pipeline_runs.
+
+    Safety:
+    - Never raises.
+    - Prints error if logging fails.
+    """
+    table_id = f"{project}.ops.pipeline_runs"
+
+    # Truncate notes defensively
+    if notes and len(notes) > 1000:
+        notes = notes[:1000]
+
+    row = {
+        "run_id": run_id,
+        "job_name": job_name,
+        # insert_rows_json requires JSON-safe types → use strings for TIMESTAMP
+        "start_ts": _to_rfc3339_utc(start_ts),
+        "end_ts": _to_rfc3339_utc(end_ts),
+        "status": status,
+        "rows_written": int(rows_written),
+        "notes": notes or "",
+    }
+
+    try:
+        client = bigquery.Client(project=project)
+        errors = client.insert_rows_json(table_id, [row])
+        if errors:
+            print(f"[pipeline_runs] ERROR inserting row: {errors}", flush=True)
+    except Exception as e:
+        print(f"[pipeline_runs] ERROR logging run: {e}", flush=True)

@@ -14,3 +14,7 @@ data/tmp/
 # OS junk
 .DS_Store
 Thumbs.db
+
+# Data junk for repo
+*.nc
+*.part

@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# src/ingest/sst.py
 
 """
 Ingest NOAA OISST v2.1 daily SST via ERDDAP into BigQuery standard.sst_daily.
@@ -7,6 +6,7 @@ Ingest NOAA OISST v2.1 daily SST via ERDDAP into BigQuery standard.sst_daily.
 
 from __future__ import annotations
 
+import uuid
 import argparse
 import datetime as dt
 from pathlib import Path
@@ -14,7 +14,11 @@ from pathlib import Path
 import pandas as pd
 import xarray as xr
 
-from src.ingest.helpers.bigquery import delete_existing_sst_rows, load_to_bigquery
+from src.ingest.helpers.bigquery import (
+    delete_existing_sst_rows,
+    load_to_bigquery,
+    log_pipeline_run,
+)
 from src.ingest.helpers.dates import month_range
 from src.ingest.helpers.df_validate import require_columns, require_non_nulls
 from src.ingest.helpers.erddap import build_griddap_dims, build_griddap_nc_url_one, lon_to_360, utc_day_bounds
@@ -136,59 +140,83 @@ def subset_to_long(ds: xr.Dataset, *, region_id: str, log: LogFn) -> pd.DataFram
     log(f"rows_ready={len(df):,}", level="INFO")
     return df
 
-
 def main() -> None:
     args = parse_args()
     log = make_logger(args.log_level, DRIVER_NAME)
 
-    if not (1 <= args.month <= 12):
-        raise SystemExit("--month must be between 1 and 12")
-    if args.year < 1980 or args.year > dt.date.today().year:
-        raise SystemExit("--year seems out of range")
+    run_id = str(uuid.uuid4())
+    start_ts = dt.datetime.now(dt.timezone.utc)
+    rows_written = 0
+    status = "FAILED"
+    notes = ""
 
-    regions = load_regions(args.regions_yaml)
-    if args.region_id not in regions:
-        known = ", ".join(sorted(regions.keys()))
-        raise SystemExit(f"Unknown --region_id {args.region_id!r}. Known: {known}")
-    bb = regions[args.region_id]
+    try:
+        if not (1 <= args.month <= 12):
+            raise SystemExit("--month must be between 1 and 12")
+        if args.year < 1980 or args.year > dt.date.today().year:
+            raise SystemExit("--year seems out of range")
 
-    d0, d1 = month_range(args.year, args.month)
+        regions = load_regions(args.regions_yaml)
+        if args.region_id not in regions:
+            known = ", ".join(sorted(regions.keys()))
+            raise SystemExit(f"Unknown --region_id {args.region_id!r}. Known: {known}")
+        bb = regions[args.region_id]
 
-    log(
-        f"start region={args.region_id} period={d0}..{d1} dry_run={args.dry_run} "
-        f"replace={args.replace} force_download={args.force_download} min_bytes={args.min_bytes}",
-        level="INFO",
-    )
+        d0, d1 = month_range(args.year, args.month)
 
-    url = build_sst_erddap_url(d0, d1, bb)
-    log(f"fetch_url={url}", level="DEBUG")
+        url = build_sst_erddap_url(d0, d1, bb)
 
-    out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    local_nc = out_dir / f"sst_{args.region_id}_{args.year}_{args.month:02d}.nc"
-    log(f"download_path={local_nc}", level="DEBUG")
+        out_dir = Path(args.out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        local_nc = out_dir / f"sst_{args.region_id}_{args.year}_{args.month:02d}.nc"
 
-    ensure_local_netcdf(url, local_nc, force_download=args.force_download, min_bytes=args.min_bytes, log=log)
+        ensure_local_netcdf(url, local_nc, force_download=args.force_download, min_bytes=args.min_bytes, log=log)
 
-    with xr.open_dataset(local_nc) as ds:
-        df = subset_to_long(ds, region_id=args.region_id, log=log)
+        with xr.open_dataset(local_nc) as ds:
+            df = subset_to_long(ds, region_id=args.region_id, log=log)
 
-    if args.dry_run:
-        log("dry_run: skipped BigQuery load.", level="INFO")
-        return
+        table_id = f"{args.bq_project}.{args.bq_dataset}.{args.bq_table}"
 
-    table_id = f"{args.bq_project}.{args.bq_dataset}.{args.bq_table}"
+        if args.dry_run:
+            status = "SUCCESS"
+            rows_written = 0
+        else:
+            if args.replace:
+                delete_existing_sst_rows(args.bq_project, args.bq_dataset, args.bq_table, args.region_id, d0, d1)
 
-    if args.replace:
-        log(f"replace=true delete_existing table={table_id} region={args.region_id} period={d0}..{d1}", level="INFO")
-        delete_existing_sst_rows(args.bq_project, args.bq_dataset, args.bq_table, args.region_id, d0, d1)
-    else:
-        log("replace=false (append only)", level="INFO")
+            load_to_bigquery(df, args.bq_project, args.bq_dataset, args.bq_table, BQ_SCHEMA)
 
-    log(f"load_bq table={table_id} rows={len(df):,}", level="INFO")
-    load_to_bigquery(df, args.bq_project, args.bq_dataset, args.bq_table, BQ_SCHEMA)
-    log(f"done table={table_id}", level="INFO")
+            rows_written = len(df)
+            status = "SUCCESS"
 
+        notes = (
+            f"region={args.region_id} "
+            f"year={args.year} month={args.month} "
+            f"dry_run={args.dry_run} replace={args.replace} "
+            f"table={args.bq_dataset}.{args.bq_table} "
+            f"dataset_id={DATASET_ID}"
+        )
+
+    except Exception as e:
+        err_msg = str(e)
+        notes = f"err={err_msg[:500]}"
+        raise
+
+    finally:
+        end_ts = dt.datetime.now(dt.timezone.utc)
+        try:
+            log_pipeline_run(
+                project=args.bq_project,
+                run_id=run_id,
+                job_name="ingest_sst",
+                start_ts=start_ts,
+                end_ts=end_ts,
+                status=status,
+                rows_written=rows_written,
+                notes=notes,
+            )
+        except Exception as e:
+            print(f"[pipeline_runs] ERROR (script wrapper): {e}", flush=True)            
 
 if __name__ == "__main__":
     main()

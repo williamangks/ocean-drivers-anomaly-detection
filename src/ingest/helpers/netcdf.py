@@ -49,7 +49,7 @@ def validate_netcdf_file(path: str | Path, min_bytes: int = DEFAULT_MIN_BYTES) -
     return False, f"path={p} bad_header head4={head4!r} size={size}B"
 
 
-def _download_with_urlopen(url: str, tmp_path: Path, timeout: int = 60) -> None:
+def _download_with_urlopen(url: str, tmp_path: Path, timeout: int = 180) -> None:
     req = urllib.request.Request(url, headers={"User-Agent": "ocean-drivers-anomaly-detection/1.0"})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -99,7 +99,7 @@ def ensure_local_netcdf(
             if tmp_path.exists():
                 tmp_path.unlink()
 
-            _download_with_urlopen(safe_url, tmp_path, timeout=60)
+            _download_with_urlopen(safe_url, tmp_path, timeout=180)
 
             ok_tmp, info_tmp = validate_netcdf_file(tmp_path, min_bytes=min_bytes)
             if not ok_tmp:
