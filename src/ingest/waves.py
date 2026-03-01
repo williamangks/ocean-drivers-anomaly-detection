@@ -20,25 +20,26 @@ Notes:
 
 from __future__ import annotations
 
-import uuid
 import argparse
 import datetime as dt
+import os
 from pathlib import Path
-from typing import List, Sequence
+from typing import Sequence
+from dataclasses import dataclass
 
 import pandas as pd
 import xarray as xr
 
-from src.ingest.helpers.bigquery import (
-    delete_existing_waves_rows,
-    load_to_bigquery,
-    log_pipeline_run,
-)
+from src.ingest.helpers.bq_casting import coerce_df_to_schema
+from src.ingest.helpers.cli_defaults import env_default, env_required
+from src.ingest.helpers.bigquery import delete_existing_waves_rows, load_to_bigquery
 from src.ingest.helpers.syslogging import make_logger, LogFn
-from src.ingest.helpers.regions import load_regions, BoundBox
 from src.ingest.helpers.dates import month_range
+from src.ingest.helpers.regions import BoundBox
 from src.ingest.helpers.netcdf import ensure_local_netcdf
+from src.ingest.helpers.pipeline import run_tracked
 from src.ingest.helpers.df_validate import require_columns, require_non_nulls
+from src.ingest.helpers.region_validate import require_region
 from src.ingest.helpers.erddap import (
     lon_intervals_360,
     utc_day_bounds,
@@ -51,6 +52,7 @@ from src.ingest.helpers.xr_utils import (
     apply_fill_to_nan,
     open_xr_datasets,
 )
+
 
 DEFAULT_MIN_BYTES = 1024
 
@@ -86,20 +88,28 @@ REQUIRED_COLS = [name for name, _, mode in BQ_SCHEMA if mode == "REQUIRED"]
 RAW_REQUIRED_COLS = {"time", "lat", "lon", *set(VAR_MAP.values())}
 
 
+@dataclass(frozen=True)
+class LonIntervalRequest:
+    """
+    Represents one ERDDAP request for a specific longitude interval.
+    """
+    url: str
+    lon_interval: tuple[float, float]
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Ingest WW3 waves via ERDDAP into BigQuery (daily aggregated).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--regions_yaml", default="src/config/regions.yaml", help="Path to regions YAML config.")
+    p.add_argument("--bq_project", default=env_default("BQ_PROJECT", ""), required=env_required("BQ_PROJECT"))
+    p.add_argument("--bq_dataset", default=env_default("BQ_DATASET", "standard"))
+    p.add_argument("--bq_table", default=env_default("BQ_TABLE_WAVES", "waves_daily"))
+    p.add_argument("--out_dir", default=env_default("OUT_DIR", "data/tmp"))
+    p.add_argument("--regions_yaml", default=os.getenv("REGIONS_YAML", "src/config/regions.yaml"))
     p.add_argument("--region_id", required=True, help="Region id key from regions.yaml (ex: NTT).")
     p.add_argument("--year", type=int, required=True, help="Year to ingest (UTC).")
     p.add_argument("--month", type=int, required=True, help="Month to ingest (1-12, UTC).")
-    p.add_argument("--bq_project", required=True, help="BigQuery project id.")
-    p.add_argument("--bq_dataset", default="standard", help="BigQuery dataset.")
-    p.add_argument("--bq_table", default="waves_daily", help="BigQuery table.")
     p.add_argument("--dry_run", action="store_true", help="Fetch + transform only; skip BigQuery load.")
-    p.add_argument("--out_dir", default="data/tmp", help="Local directory for downloaded NetCDF files.")
     p.add_argument("--replace", action="store_true", help="Delete existing rows for region+month before loading.")
     p.add_argument("--force_download", action="store_true", help="Re-download the NetCDF even if cached exists.")
     p.add_argument("--min_bytes", type=int, default=DEFAULT_MIN_BYTES, help="Minimum bytes for cached NetCDF validity.")
@@ -108,17 +118,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--log_level", default="INFO", choices=["ERROR", "INFO", "DEBUG"], help="Logging verbosity")
     return p.parse_args()
 
-
 def validate_raw_dataframe(df: pd.DataFrame) -> None:
     require_columns(df, RAW_REQUIRED_COLS, label="waves raw_df")
-
 
 def validate_standardized_dataframe(df: pd.DataFrame) -> None:
     require_columns(df, STANDARD_COLS_SET, label="waves standardized_df")
     require_non_nulls(df, REQUIRED_COLS, label="waves standardized_df")
 
-
-def build_0_360_lon_split_urls(
+def build_lon_interval_requests_0_360(
     *,
     base: str,
     dataset_id: str,
@@ -128,21 +135,19 @@ def build_0_360_lon_split_urls(
     bb: BoundBox,
     include_singleton_dim: bool,
     singleton_value: float = 0.0,
-) -> list[tuple[str, tuple[float, float]]]:
+) -> list[LonIntervalRequest]:
     """
-    WW3-specific: dataset lon is 0..360; regions may cross the dateline.
+    Build ERDDAP request specs for 0..360 longitude datasets.
 
-    Build 1 or 2 griddap URLs by splitting the lon interval in 0..360 space.
+    If the region crosses the dateline, this returns multiple requests.
     Uses an end-exclusive day window: [date_start, date_end + 1 day).
-
-    Returns:
-        List[(url, (lon0, lon1))] where (lon0, lon1) is the interval returned by lon_intervals_360().
     """
     t0, t1 = utc_day_bounds(date_start, date_end, end_exclusive=True)
 
     lat_min, lat_max = sorted([bb.lat_min, bb.lat_max])
 
-    out: list[tuple[str, tuple[float, float]]] = []
+    requests: list[LonIntervalRequest] = []
+
     for lo0, lo1 in lon_intervals_360(bb.lon_min, bb.lon_max):
         dims = build_griddap_dims(
             t0=t0,
@@ -154,11 +159,22 @@ def build_0_360_lon_split_urls(
             include_singleton_dim=include_singleton_dim,
             singleton_value=singleton_value,
         )
-        url = build_griddap_nc_url(base=base, dataset_id=dataset_id, variables=variables, dims=dims)
-        out.append((url, (lo0, lo1)))
 
-    return out
+        url = build_griddap_nc_url(
+            base=base,
+            dataset_id=dataset_id,
+            variables=variables,
+            dims=dims,
+        )
 
+        requests.append(
+            LonIntervalRequest(
+                url=url,
+                lon_interval=(lo0, lo1),
+            )
+        )
+
+    return requests
 
 def _waves_cache_filename(
     *,
@@ -177,7 +193,7 @@ def _waves_cache_filename(
 
 def download_intervals(
     *,
-    url_specs: list[tuple[str, tuple[float, float]]],
+    interval_requests: list[tuple[LonIntervalRequest],
     out_dir: Path,
     region_id: str,
     year: int,
@@ -185,28 +201,34 @@ def download_intervals(
     force_download: bool,
     min_bytes: int,
     log: LogFn,
-) -> List[Path]:
-    split = len(url_specs) > 1
-    log(f"dateline_split={split} intervals={len(url_specs)}", level="INFO")
+) -> list[Path]:
+    split = len(requests) > 1
+    log(f"dateline_split={split} intervals={len(requests)}", level="INFO")
 
-    paths: List[Path] = []
-    for idx, (url, interval) in enumerate(url_specs, start=1):
-        lo0, lo1 = interval
+    paths: list[Path] = []
+    for idx, req in enumerate(requests, start=1):
+        lo0, lo1 = req.lon_interval
         log(f"lon_interval[{idx}]={lo0:.1f}..{lo1:.1f} (0..360)", level="INFO")
-        log(f"fetch_url[{idx}]={url}", level="DEBUG")
+        log(f"fetch_url[{idx}]={req.url}", level="DEBUG")
 
         local_nc = out_dir / _waves_cache_filename(
             region_id=region_id, year=year, month=month, idx=idx, interval=interval, split=split
         )
         log(f"download_path[{idx}]={local_nc}", level="DEBUG")
 
-        ensure_local_netcdf(url, local_nc, force_download=force_download, min_bytes=min_bytes, log=log)
+        ensure_local_netcdf(
+            req.url,
+            local_nc,
+            force_download=force_download,
+            min_bytes=min_bytes,
+            log=log
+        )
         paths.append(local_nc)
 
     return paths
 
 
-def to_daily_mean_dataset(
+def aggregate_hourly_to_daily_mean(
     dsets: list[xr.Dataset],
     *,
     var_map: dict[str, str],
@@ -304,39 +326,29 @@ def main() -> None:
     args = parse_args()
     log = make_logger(args.log_level, DRIVER_NAME)
 
-    run_id = str(uuid.uuid4())
-    start_ts = dt.datetime.now(dt.timezone.utc)
-    rows_written = 0
-    status = "FAILED"
-    notes = ""
+    if not (1 <= args.month <= 12):
+        raise SystemExit("--month must be between 1 and 12")
 
-    try:
-        if not (1 <= args.month <= 12):
-            raise SystemExit("--month must be between 1 and 12")
+    if args.year < 2016 or args.year > dt.date.today().year + 1:
+        raise SystemExit("--year seems out of range")
 
-        if args.year < 2016 or args.year > dt.date.today().year + 1:
-            raise SystemExit("--year seems out of range")
+    bb = require_region(args.regions_yaml, args.region_id)
 
-        regions = load_regions(args.regions_yaml)
-        if args.region_id not in regions:
-            known = ", ".join(sorted(regions.keys()))
-            raise SystemExit(f"Unknown --region_id {args.region_id!r}. Known: {known}")
-        bb = regions[args.region_id]
+    d0, d1 = month_range(args.year, args.month)
 
-        d0, d1 = month_range(args.year, args.month)
+    log(
+        f"start region={args.region_id} period={d0}..{d1} "
+        f"dry_run={args.dry_run} replace={args.replace} "
+        f"force_download={args.force_download} min_bytes={args.min_bytes} "
+        f"no_depth_dim={args.no_depth_dim} dataset_id={DATASET_ID} vars={list(VAR_MAP.keys())}",
+        level="INFO",
+    )
 
-        log(
-            f"start region={args.region_id} period={d0}..{d1} "
-            f"dry_run={args.dry_run} replace={args.replace} "
-            f"force_download={args.force_download} min_bytes={args.min_bytes} "
-            f"no_depth_dim={args.no_depth_dim} dataset_id={DATASET_ID} vars={list(VAR_MAP.keys())}",
-            level="INFO",
-        )
-
+    def _job() -> tuple[int, str]:
         out_dir = Path(args.out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        url_specs = build_0_360_lon_split_urls(
+        interval_requests = build_lon_interval_requests_0_360(
             base=ERDDAP_BASE,
             dataset_id=DATASET_ID,
             variables=list(VAR_MAP.keys()),
@@ -347,8 +359,8 @@ def main() -> None:
             singleton_value=0.0,
         )
 
-        local_paths = download_intervals(
-            url_specs=url_specs,
+        local_paths = download_intervals_requests(
+            requests=interval_requests,
             out_dir=out_dir,
             region_id=args.region_id,
             year=args.year,
@@ -359,7 +371,7 @@ def main() -> None:
         )
 
         with open_xr_datasets(local_paths) as dsets:
-            ds_daily = to_daily_mean_dataset(
+            ds_daily = aggregate_hourly_to_daily_mean(
                 dsets,
                 var_map=VAR_MAP,
                 singleton_dim=None if args.no_depth_dim else "depth",
@@ -368,8 +380,6 @@ def main() -> None:
             )
             df = daily_to_dataframe(ds_daily, region_id=args.region_id, d0=d0, d1=d1, log=log)
 
-        log(f"rows_ready={len(df):,}", level="INFO")
-
         if args.log_row_stats:
             log_row_stats(df, log)
 
@@ -377,7 +387,6 @@ def main() -> None:
 
         if args.dry_run:
             log("dry_run: skipped BigQuery load.", level="INFO")
-            status = "SUCCESS"
             rows_written = 0
         else:
             if args.replace:
@@ -385,18 +394,15 @@ def main() -> None:
                     f"replace=true delete_existing table={table_id} region={args.region_id} period={d0}..{d1}",
                     level="INFO",
                 )
-                delete_existing_waves_rows(args.bq_project, args.bq_dataset, args.bq_table, args.region_id, d0, d1)
+                delete_existing_waves_rows(
+                    args.bq_project, args.bq_dataset, args.bq_table, args.region_id, d0, d1
+                )
             else:
                 log("replace=false (append only)", level="INFO")
 
-            if df[REQUIRED_COLS].isna().any().any():
-                bad = df[df[REQUIRED_COLS].isna().any(axis=1)].head(10)
-                raise ValueError(f"Nulls in REQUIRED fields:\n{bad}")
-
             log(f"load_bq table={table_id} rows={len(df):,}", level="INFO")
+            df = coerce_df_to_schema(df, BQ_SCHEMA)
             load_to_bigquery(df, args.bq_project, args.bq_dataset, args.bq_table, BQ_SCHEMA)
-
-            status = "SUCCESS"
             rows_written = len(df)
 
         notes = (
@@ -405,36 +411,14 @@ def main() -> None:
             f"table={args.bq_dataset}.{args.bq_table} "
             f"dataset_id={DATASET_ID} no_depth_dim={args.no_depth_dim}"
         )
+        return rows_written, notes
 
-    except Exception as e:
-        err_msg = f"{type(e).__name__}: {e}"
-        notes = (
-            f"region={getattr(args, 'region_id', None)} "
-            f"year={getattr(args, 'year', None)} month={getattr(args, 'month', None)} "
-            f"dry_run={getattr(args, 'dry_run', None)} replace={getattr(args, 'replace', None)} "
-            f"table={getattr(args, 'bq_dataset', None)}.{getattr(args, 'bq_table', None)} "
-            f"dataset_id={DATASET_ID} "
-            f"err={err_msg[:500]}"
-        )
-        status = "FAILED"
-        rows_written = 0
-        raise
-
-    finally:
-        end_ts = dt.datetime.now(dt.timezone.utc)
-        try:
-            log_pipeline_run(
-                project=args.bq_project,
-                run_id=run_id,
-                job_name="ingest_waves",
-                start_ts=start_ts,
-                end_ts=end_ts,
-                status=status,
-                rows_written=rows_written,
-                notes=notes,
-            )
-        except Exception as e:
-            print(f"[pipeline_runs] ERROR (script wrapper): {e}", flush=True)
+    run_tracked(
+        project=args.bq_project,
+        job_name="ingest_waves",
+        log=log,
+        fn=_job,
+    )
 
 if __name__ == "__main__":
     main()

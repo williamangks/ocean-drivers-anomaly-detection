@@ -178,3 +178,65 @@ Often chosen because it:
 
 ### **Transferability Validation**
 Testing whether anomaly patterns learned in one region (e.g., Hawaiʻi) generalize to another region (e.g., NTT, Indonesia).
+
+---
+
+## Data Architecture Terms
+### Standard Layer
+BigQuery dataset containing cleaned, normalized physical measurements per source.
+No modeling logic is applied here.
+
+### Feature Layer
+Derived dataset containing:
+- region-level daily aggregates
+- lag features
+- rolling statistics
+- seasonality signals
+
+Used directly for ML training.
+
+### Ops Layer
+Operational dataset used for:
+- run tracking
+- ingestion monitoring
+- failure debugging
+- auditability
+
+### Dailyization (Chlorophyll)
+Process of mapping an 8-day composite window to individual days using:
+    GENERATE_DATE_ARRAY(period_start_date, period_end_date)
+
+Each day inherits the spatially-averaged composite value.
+
+### Region-Level Aggregation
+Spatial reduction of grid-level data into a single daily mean per region.
+This:
+- reduces dimensionality
+- stabilizes signals
+- simplifies anomaly detection
+
+### Rolling Window
+A backward-looking time window (e.g., 7 days) used to compute:
+- moving average (ma7)
+- moving standard deviation (sd7)
+
+Defined in SQL as:
+    ROWS BETWEEN 6 PRECEDING AND CURRENT ROW
+
+### Anomaly Detection (Isolation Forest)
+Unsupervised model that identifies rare patterns in multivariate space.
+
+Input features include:
+- SST
+- Significant wave height
+- Peak wave period
+- Chlorophyll
+- Rolling statistics
+- Seasonal features
+
+### Grain
+The meaning of one row in a table.
+
+Examples:
+- standard.sst_daily: (region_id, date, lat, lon)
+- features.region_daily_base: (region_id, date)

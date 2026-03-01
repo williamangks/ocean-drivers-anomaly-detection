@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
 """
-helpers/pipeline.py
-
 Reusable pipeline-run wrapper:
 - standardizes run_id/start/end/status/notes handling
 - always logs into ops.pipeline_runs in a finally block
@@ -11,42 +9,52 @@ from __future__ import annotations
 
 import datetime as dt
 import uuid
-from typing import Callable, Tuple
+from typing import Callable
 
 from src.ingest.helpers.bigquery import log_pipeline_run
 from src.ingest.helpers.syslogging import LogFn
 
 
-def run_tracked(  # CHANGED: new reusable wrapper (new file)
+def run_tracked(
     *,
     project: str,
     job_name: str,
     log: LogFn,
-    fn: Callable[[], Tuple[int, str]],
+    fn: Callable[[], tuple[int, str]],
 ) -> None:
     """
     Run a job function and always log an ops.pipeline_runs row.
 
     fn() must return: (rows_written, notes)
     """
-    run_id = str(uuid.uuid4())  # CHANGED: moved from each script into one place
-    start_ts = dt.datetime.now(dt.timezone.utc)  # CHANGED: moved from each script into one place
+    run_id = str(uuid.uuid4())
+    start_ts = dt.datetime.now(dt.timezone.utc)
 
     status = "FAILED"
     rows_written = 0
     notes = ""
 
+    log(f"run_started run_id={run_id} job={job_name}", level="INFO")
     try:
         rows_written, notes = fn()
         status = "SUCCESS"
     except Exception as e:
-        # CHANGED: centralized error notes formatting; scripts can still override notes if they want
+        status = "FAILED"
+
         err_msg = f"{type(e).__name__}: {e}"
-        if not notes:
-            notes = f"err={err_msg[:500]}"
+        err_kv = f"err={err_msg[:500]}"
+
+        base = f"job={job_name} run_id={run_id}"
+
+        if notes:
+            notes = f"{base} {notes} {err_kv}"
+        else:
+            notes = f"{base} {err_kv}"
+
         raise
     finally:
-        end_ts = dt.datetime.now(dt.timezone.utc)  # CHANGED: moved from each script into one place
+        end_ts = dt.datetime.now(dt.timezone.utc)
+
         try:
             log_pipeline_run(
                 project=project,
@@ -59,5 +67,4 @@ def run_tracked(  # CHANGED: new reusable wrapper (new file)
                 notes=notes,
             )
         except Exception as e:
-            # CHANGED: wrapper never fails the job due to logging
-            print(f"[pipeline_runs] ERROR (script wrapper): {e}", flush=True)
+            log(f"pipeline_runs_log_failed err={type(e).__name__}: {e}", level="ERROR")

@@ -23,6 +23,67 @@ Later phases (not implemented yet):
 
 ---
 
+## Core Concept
+
+This project combines ocean science data formats with data engineering patterns.
+
+### ERDDAP → NetCDF → Pandas → BigQuery
+
+Each ingestion script (`src/ingest/sst.py`, `chl.py`, `waves.py`) follows the same pattern:
+
+1. Build an **ERDDAP griddap URL** using:
+   - region bounding box (`regions.yaml`)
+   - time window (year/month)
+2. Download a **NetCDF subset** (cached locally in `data/tmp/`)
+3. Parse using **xarray**
+4. Convert to long-format **pandas DataFrame**
+5. Validate schema
+6. Load into **BigQuery standard layer**
+
+This keeps ingestion reproducible and idempotent.
+
+---
+
+### Standard Layer, and Ops Layer
+
+The warehouse is intentionally split into two layers:
+
+- **`standard` dataset**
+  - Cleaned, standardized environmental measurements
+  - Partitioned by date
+  - Used for analytics and future ML feature engineering
+
+- **`ops` dataset**
+  - Operational tracking tables
+  - `ops.pipeline_runs` stores:
+    - run_id
+    - job_name
+    - start/end timestamps
+    - SUCCESS/FAILED
+    - rows_written
+    - notes
+
+This separation mirrors production data platforms:
+data tables vs observability tables.
+
+---
+
+### Idempotent Monthly Loads
+
+Each ingestion script supports:
+
+- `--dry_run` → test full pipeline without writing to BigQuery
+- `--replace` → delete existing rows for region+month before loading
+
+This ensures:
+- safe re-runs
+- clean backfills
+- no duplicate month partitions
+
+Idempotency is enforced using `DELETE` queries before load (see `helpers/bigquery.py`).
+
+---
+
 ## Data sources (implemented)
 This project subsets global gridded datasets by region bounding box.
 
@@ -57,9 +118,158 @@ Tables:
 ---
 
 ## Repo structure (high level)
-tree .
+.
+├── GLOSSARY.md
+├── README.md
+├── data
+│   └── tmp
+│       ├── chl_NTT_2024_01.nc
+│       ├── sst_NTT_2024_01.nc
+│       └── waves_NTT_2024_01.nc
+├── requirements.txt
+├── scripts
+│   └── provision_bigquery.sh
+├── sql
+│   ├── create_features_tables.sql
+│   ├── create_ops_tables.sql
+│   ├── create_standard_tables.sql
+│   └── verification
+│       └── qa_checks_base_mart.sql
+└── src
+    ├── __init__.py
+    ├── __pycache__
+    │   └── __init__.cpython-314.pyc
+    ├── config
+    │   ├── regions.yaml
+    │   └── sources.yaml
+    └── ingest
+        ├── __init__.py
+        ├── __pycache__
+        │   ├── __init__.cpython-314.pyc
+        │   ├── chl.cpython-314.pyc
+        │   ├── sst.cpython-314.pyc
+        │   └── waves.cpython-314.pyc
+        ├── chl.py
+        ├── helpers
+        │   ├── __init__.py
+        │   ├── __pycache__
+        │   │   ├── __init__.cpython-314.pyc
+        │   │   ├── bigquery.cpython-314.pyc
+        │   │   ├── bq_casting.cpython-314.pyc
+        │   │   ├── cli_defaults.cpython-314.pyc
+        │   │   ├── dates.cpython-314.pyc
+        │   │   ├── df_validate.cpython-314.pyc
+        │   │   ├── erddap.cpython-314.pyc
+        │   │   ├── netcdf.cpython-314.pyc
+        │   │   ├── pipeline.cpython-314.pyc
+        │   │   ├── regions.cpython-314.pyc
+        │   │   ├── syslogging.cpython-314.pyc
+        │   │   └── xr_utils.cpython-314.pyc
+        │   ├── bigquery.py
+        │   ├── bq_casting.py
+        │   ├── cli_defaults.py
+        │   ├── dates.py
+        │   ├── df_validate.py
+        │   ├── erddap.py
+        │   ├── netcdf.py
+        │   ├── pipeline.py
+        │   ├── regions.py
+        │   ├── run_tracking.py
+        │   ├── syslogging.py
+        │   └── xr_utils.py
+        ├── sst.py
+        └── waves.py
 
+---
 
+## Data Layers
+This project follows a layered data architecture in BigQuery.
+
+### standard dataset — Standardized Physical Measurements
+Contains cleaned, normalized, analysis-ready physical measurements per source.
+
+Grain:
+- sst_daily: one row per (region_id, date, lat, lon)
+- waves_daily: one row per (region_id, date, lat, lon)
+- chl_8day: one row per (region_id, period_start_date, period_end_date, lat, lon)
+
+Characteristics:
+- Units normalized (°C, meters, seconds, mg/m³)
+- Fill values converted to NULL
+- Partitioned by date (or period_start_date)
+- Clustered by region_id
+- No modeling logic
+
+### features dataset — Model-Ready Tables
+Contains region-aggregated, daily feature tables used for anomaly detection.
+
+Grain:
+- region_daily_base: one row per (region_id, date)
+- region_daily_features: one row per (region_id, date) with lag/rolling features
+- region_daily_base includes:
+- sst_c_mean
+- swh_m_mean
+- peak_period_s_mean
+- chl_mg_m3_mean (dailyized from 8-day windows)
+
+region_daily_features adds:
+- 1-day lags
+- first differences
+- 7-day rolling mean/std
+- seasonal signals (day-of-year, month)
+
+These tables are used directly for ML training and scoring.
+
+### ops dataset — Pipeline Observability
+Contains operational tracking tables.
+
+ops.pipeline_runs:
+- One row per job execution
+- SUCCESS / FAILED
+- rows_written
+- start/end timestamps
+- error snippet in notes
+
+This enables:
+- reproducibility
+- debugging
+- monitoring ingestion health
+
+---
+
+## Build Order
+1) Create datasets (asia-southeast2 / Jakarta)
+2) Run:
+- sql/create_ops_tables.sql
+- sql/create_standard_tables.sql
+3) Run ingestion:
+- python -m src.ingest.sst
+- python -m src.ingest.chl
+- python -m src.ingest.waves
+4) Run:
+- sql/create_features_tables.sql
+5) Run QA:
+- sql/qa_checks.sql
+6)Train anomaly model
+
+---
+
+## BigQuery Location
+All datasets are created in:
+    asia-southeast2 (Jakarta)
+
+All queries must be executed with:
+    Processing location: asia-southeast2
+
+BigQuery does not allow cross-region queries.
+
+---
+
+## Feature Engineering Philosophy
+- Spatial signals are aggregated to region-level daily means.
+- Chlorophyll 8-day composites are dailyized via window overlap.
+- Rolling statistics capture short-term anomalies.
+- No leakage from future dates is allowed in rolling windows.
 
 ---
 

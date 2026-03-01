@@ -14,7 +14,6 @@ Time handling:
 
 from __future__ import annotations
 
-import uuid
 import argparse
 import datetime as dt
 import os
@@ -26,19 +25,22 @@ import xarray as xr
 from src.ingest.helpers.bigquery import (
     delete_existing_chl_rows,
     load_to_bigquery,
-    log_pipeline_run,
 )
+from src.ingest.helpers.bq_casting import coerce_df_to_schema
+from src.ingest.helpers.cli_defaults import env_default, env_required
 from src.ingest.helpers.dates import month_range
 from src.ingest.helpers.df_validate import require_columns, require_non_nulls
 from src.ingest.helpers.erddap import build_griddap_dims, build_griddap_nc_url_one, utc_day_bounds
 from src.ingest.helpers.netcdf import ensure_local_netcdf
-from src.ingest.helpers.regions import BoundBox, load_regions
+from src.ingest.helpers.regions import BoundBox
+from src.ingest.helpers.pipeline import run_tracked
 from src.ingest.helpers.syslogging import LogFn, make_logger
 from src.ingest.helpers.xr_utils import apply_fill_to_nan, standardize_lat_lon
+from src.ingest.helpers.region_validate import require_region
 
 DEFAULT_MIN_BYTES = 1024
-PS = "period_start_date"
-PE = "period_end_date"
+PERIOD_START_COL = "period_start_date"
+PERIOD_END_COL = "period_end_date"
 
 ERDDAP_BASE = "https://coastwatch.pfeg.noaa.gov/erddap/griddap"
 DATASET_ID = "erdMBchla8day_LonPM180"
@@ -69,20 +71,20 @@ def parse_args() -> argparse.Namespace:
         description="Ingest chlorophyll-a 8-day composites via ERDDAP into BigQuery.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
+    p.add_argument("--bq_project", default=env_default("BQ_PROJECT", ""), required=env_required("BQ_PROJECT"))
+    p.add_argument("--bq_dataset", default=env_default("BQ_DATASET", "standard"))
+    p.add_argument("--bq_table", default=env_default("BQ_TABLE_CHL", "chl_8day"))
+    p.add_argument("--out_dir", default=env_default("OUT_DIR", "data/tmp"))
     p.add_argument("--regions_yaml", default=os.getenv("REGIONS_YAML", "src/config/regions.yaml"))
     p.add_argument("--region_id", required=True)
     p.add_argument("--year", type=int, required=True)
     p.add_argument("--month", type=int, required=True)
-    p.add_argument("--bq_project", default=os.getenv("BQ_PROJECT"), required=os.getenv("BQ_PROJECT") is None)
-    p.add_argument("--bq_dataset", default=os.getenv("BQ_DATASET", "standard"))
-    p.add_argument("--bq_table", default=os.getenv("BQ_TABLE", "chl_8day"))
     p.add_argument("--dry_run", action="store_true")
-    p.add_argument("--out_dir", default=os.getenv("OUT_DIR", "data/tmp"))
     p.add_argument("--replace", action="store_true")
     p.add_argument("--force_download", action="store_true")
     p.add_argument("--min_bytes", type=int, default=DEFAULT_MIN_BYTES)
     p.add_argument("--log_row_stats", action="store_true")
-    p.add_argument("--query_end_pad_days", type=int, default=7)
+    p.add_argument("--pad_days", type=int, default=7)
     p.add_argument("--log_level", default="INFO", choices=["ERROR", "INFO", "DEBUG"])
     return p.parse_args()
 
@@ -134,8 +136,8 @@ def subset_to_long(ds: xr.Dataset, *, region_id: str, log: LogFn) -> pd.DataFram
     validate_raw_dataframe(raw_df)
 
     center_ts = pd.to_datetime(raw_df["time"], utc=True)
-    raw_df[PS] = (center_ts - pd.Timedelta(days=3)).dt.date
-    raw_df[PE] = (center_ts + pd.Timedelta(days=4)).dt.date
+    raw_df[PERIOD_START_COL] = (center_ts - pd.Timedelta(days=3)).dt.date
+    raw_df[PERIOD_END_COL] = (center_ts + pd.Timedelta(days=4)).dt.date
     raw_df.drop(columns=["time"], inplace=True)
 
     raw_df["region_id"] = region_id
@@ -151,7 +153,7 @@ def subset_to_long(ds: xr.Dataset, *, region_id: str, log: LogFn) -> pd.DataFram
     return df
 
 def filter_overlap_month(df: pd.DataFrame, d0: dt.date, d1: dt.date) -> pd.DataFrame:
-    return df[(df[PS] <= d1) & (df[PE] >= d0)].copy()
+    return df[(df[PERIOD_START_COL] <= d1) & (df[PERIOD_END_COL] >= d0)].copy()
 
 def log_row_stats(df: pd.DataFrame, log: LogFn) -> None:
     if len(df) == 0:
@@ -160,9 +162,9 @@ def log_row_stats(df: pd.DataFrame, log: LogFn) -> None:
     log(
         "row_stats "
         f"rows={len(df):,} "
-        f"min_start={df[PS].min()} "
-        f"max_end={df[PE].max()} "
-        f"unique_windows={df[[PS, PE]].drop_duplicates().shape[0]}",
+        f"min_start={df[PERIOD_START_COL].min()} "
+        f"max_end={df[PERIOD_END_COL].max()} "
+        f"unique_windows={df[[PERIOD_START_COL, PERIOD_END_COL]].drop_duplicates().shape[0]}",
         level="INFO",
     )
 
@@ -170,41 +172,40 @@ def main() -> None:
     args = parse_args()
     log = make_logger(args.log_level, DRIVER_NAME)
 
-    run_id = str(uuid.uuid4())
-    start_ts = dt.datetime.now(dt.timezone.utc)
-    rows_written = 0
-    status = "FAILED"
-    notes = ""
+    if not (1 <= args.month <= 12):
+        raise SystemExit("--month must be between 1 and 12")
 
-    try:
-        if not (1 <= args.month <= 12):
-            raise SystemExit("--month must be between 1 and 12")
+    if args.year < 1997 or args.year > dt.date.today().year + 1:
+        raise SystemExit("--year seems out of range")
 
-        regions = load_regions(args.regions_yaml)
-        if args.region_id not in regions:
-            known = ", ".join(sorted(regions.keys()))
-            raise SystemExit(f"Unknown --region_id {args.region_id!r}. Known: {known}")
-        bb = regions[args.region_id]
+    bb = require_region(args.regions_yaml, args.region_id)
+    d0, d1 = month_range(args.year, args.month)
 
-        d0, d1 = month_range(args.year, args.month)
+    log(
+        f"start region={args.region_id} period={d0}..{d1} "
+        f"dry_run={args.dry_run} replace={args.replace} "
+        f"force_download={args.force_download} min_bytes={args.min_bytes} "
+        f"pad_days={args.pad_days} dataset_id={DATASET_ID}",
+        level="INFO",
+    )
 
-        log(
-            f"start region={args.region_id} period={d0}..{d1} "
-            f"dry_run={args.dry_run} replace={args.replace} "
-            f"force_download={args.force_download} min_bytes={args.min_bytes} "
-            f"query_end_pad_days={args.query_end_pad_days} dataset_id={DATASET_ID}",
-            level="INFO",
-        )
-
-        url = build_chl_erddap_url(d0, d1, bb, pad_days=args.query_end_pad_days)
+    def _job() -> tuple[int, str]:
+        url = build_chl_erddap_url(d0, d1, bb, pad_days=args.pad_days)
         log(f"fetch_url={url}", level="DEBUG")
 
         out_dir = Path(args.out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
-        local_nc = out_dir / f"chl_{args.region_id}_{args.year}_{args.month:02d}.nc"
+
+        local_nc = out_dir / f"chl_{args.region_id}_{args.year}_{args.month:02d}.nc"  # CHANGED
         log(f"download_path={local_nc}", level="DEBUG")
 
-        ensure_local_netcdf(url, local_nc, force_download=args.force_download, min_bytes=args.min_bytes, log=log)
+        ensure_local_netcdf(
+            url,
+            local_nc,
+            force_download=args.force_download,
+            min_bytes=args.min_bytes,
+            log=log,
+        )
 
         with xr.open_dataset(local_nc) as ds:
             df = subset_to_long(ds, region_id=args.region_id, log=log)
@@ -218,7 +219,6 @@ def main() -> None:
 
         if args.dry_run:
             log("dry_run: skipped BigQuery load.", level="INFO")
-            status = "SUCCESS"
             rows_written = 0
         else:
             if args.replace:
@@ -226,52 +226,31 @@ def main() -> None:
                     f"replace=true delete_existing table={table_id} region={args.region_id} period={d0}..{d1}",
                     level="INFO",
                 )
-                delete_existing_chl_rows(args.bq_project, args.bq_dataset, args.bq_table, args.region_id, d0, d1)
+                delete_existing_chl_rows(
+                    args.bq_project, args.bq_dataset, args.bq_table, args.region_id, d0, d1
+                )
             else:
                 log("replace=false (append only)", level="INFO")
 
             log(f"load_bq table={table_id} rows={len(df):,}", level="INFO")
+            df = coerce_df_to_schema(df, BQ_SCHEMA)
             load_to_bigquery(df, args.bq_project, args.bq_dataset, args.bq_table, BQ_SCHEMA)
-
-            status = "SUCCESS"
             rows_written = len(df)
 
         notes = (
             f"region={args.region_id} year={args.year} month={args.month} "
             f"dry_run={args.dry_run} replace={args.replace} "
             f"table={args.bq_dataset}.{args.bq_table} "
-            f"dataset_id={DATASET_ID} pad_days={args.query_end_pad_days}"
+            f"dataset_id={DATASET_ID} pad_days={args.pad_days}"
         )
+        return rows_written, notes
 
-    except Exception as e:
-        err_msg = f"{type(e).__name__}: {e}"
-        notes = (
-            f"region={getattr(args, 'region_id', None)} "
-            f"year={getattr(args, 'year', None)} month={getattr(args, 'month', None)} "
-            f"dry_run={getattr(args, 'dry_run', None)} replace={getattr(args, 'replace', None)} "
-            f"table={getattr(args, 'bq_dataset', None)}.{getattr(args, 'bq_table', None)} "
-            f"dataset_id={DATASET_ID} "
-            f"err={err_msg[:500]}"
-        )
-        status = "FAILED"
-        rows_written = 0
-        raise
-
-    finally:
-        end_ts = dt.datetime.now(dt.timezone.utc)
-        try:
-            log_pipeline_run(
-                project=args.bq_project,
-                run_id=run_id,
-                job_name="ingest_chl",
-                start_ts=start_ts,
-                end_ts=end_ts,
-                status=status,
-                rows_written=rows_written,
-                notes=notes,
-            )
-        except Exception as e:
-            print(f"[pipeline_runs] ERROR (script wrapper): {e}", flush=True)
+    run_tracked(
+        project=args.bq_project,
+        job_name="ingest_chl",
+        log=log,
+        fn=_job,
+    )
 
 if __name__ == "__main__":
     main()
